@@ -1,0 +1,367 @@
+#!/bin/env python3
+import socket
+import threading
+import csv
+import os
+
+# 儲存玩家和房間資訊
+players = {}
+rooms = {}  
+games = {}
+
+def write_to_csv(username, password, state):
+    # 確保路徑存在
+    os.makedirs("server", exist_ok=True)
+    file_path = "server/userinfo.csv"
+    file_exists = os.path.isfile(file_path)
+
+    with open(file_path, mode="a", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        # 寫入使用者資料
+        writer.writerow([username, password, state])
+
+def load_from_csv():
+    file_path = "server/userinfo.csv"
+    if os.path.exists(file_path):
+        with open(file_path, mode="r", encoding="utf-8") as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                username = row["Username"]
+                players[username] = {
+                    "password": row["Password"],
+                    "state": row["State"],
+                    "socket": None,  # 尚未連線
+                    "socket2": None  # 尚未連線
+                }
+
+def save_games_to_csv(games):
+    with open("server/games.csv", "w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=["game_name", "publisher", "description", "path"])
+        writer.writeheader()
+        for game_name, details in games.items():
+            writer.writerow({"game_name": game_name, **details})
+
+def load_games_from_csv():
+    file_path = "server/games.csv"
+    if os.path.exists(file_path):
+        with open(file_path, mode="r", encoding="utf-8") as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                games[row["game_name"]] = {
+                    "publisher": row["publisher"],
+                    "description": row["description"],
+                    "path": row["path"]
+                }
+
+
+def handle_client(client_socket, client_socket2, client_address):
+    username = ""
+    while True:
+        try:
+            request = client_socket.recv(1024).decode("utf-8")
+            if not request:
+                break
+
+            # 註冊
+            if request.startswith("REGISTER"):
+                username, password = request.split()[1:]
+                if username in players:
+                    client_socket.send("註冊失敗：使用者名稱已存在".encode("utf-8"))
+                else:
+                    players[username] = {"password": password, "state": "offline", "socket": client_socket, "socket2": client_socket2}
+                    write_to_csv(username, password, "offline")
+                    client_socket.send("註冊成功".encode("utf-8"))
+
+            # 登入
+            elif request.startswith("LOGIN"):
+                username = request.split()[1]
+                if username in players:
+                    if players[username]["state"] != "offline":
+                        client_socket.send("登入失敗：使用者已在線上".encode("utf-8"))
+                    else:    
+                        client_socket.send("請輸入密碼: ".encode("utf-8"))
+                else:
+                    client_socket.send("登入失敗：使用者不存在".encode("utf-8"))
+
+            # 驗證密碼
+            elif request.startswith("PASSWORD"):
+                password = request.split()[1]
+                if players[username]["password"] == password:
+                    players[username]["state"] = "idle"
+                    client_socket.send("登入成功".encode("utf-8"))
+                    players[username]["socket"] = client_socket
+                    players[username]["socket2"] = client_socket2
+                    broadcast(f"[系統訊息] {username}登入伺服器")
+                else:
+                    client_socket.send("登入失敗：密碼錯誤".encode("utf-8"))
+
+            #列出大廳狀態
+            elif request == "DISPLAY_STATUS":
+                send_lobby_status(client_socket)
+
+            # 創建房間
+            elif request.startswith("CREATE_ROOM"):
+                _, room_name, game_type, room_type, port_number = request.split()
+                port_number = int(port_number)
+                if room_name in rooms:
+                    client_socket.send("房間名已存在，請取其他名字".encode("utf-8"))
+                elif any(room["port_number"] == port_number for room in rooms.values()):
+                    client_socket.send("port已存在，請使用其他 port".encode("utf-8"))
+                else:
+                    rooms[room_name] = {
+                        "host": username, "type": room_type, "status": "waiting", 
+                        "members": [username], "game_type": game_type, "port_number": port_number
+                    }
+                    players[username]["state"] = "in_room"
+                    if room_type == "public":
+                        client_socket.send(f"公開房間已建立，名稱: {room_name}".encode("utf-8"))
+                        broadcast(f"[系統訊息] {username}創建了公開房間{room_name}")
+                    elif room_type == "private":
+                        client_socket.send(f"私人房間已建立，名稱: {room_name}".encode("utf-8"))
+            
+            elif request.startswith("CHECK_GAME"):
+                try:
+                    _, game_type = request.split(maxsplit=1)
+                    game_type = int(game_type)
+                    if game_type == 1:
+                        game_name = "attack_game.py"
+                    elif game_type == 2:
+                        game_name = "number_guessing.py"
+                    file_path = f"server/game/{game_name}"
+                    if os.path.exists(file_path):
+                        client_socket.send(f"存在".encode("utf-8"))
+                    else:
+                        client_socket.send(f"不存在".encode("utf-8"))
+                except Exception as e:
+                    client_socket.send(f"檢查失敗: {e}".encode("utf-8"))
+
+            # 處理邀請使用者加入私人房間
+            elif request.startswith("INVITE_USER"):
+                _, invited_user, port_number = request.split()
+                port_number = int(port_number)
+
+                if "invited_users" not in players[username]:
+                    players[username]["invited_users"] = []
+
+                # 檢查被邀請的使用者是否在線上
+                if invited_user in players and players[invited_user]["state"] == "idle":
+                    client_socket.send(f"已向 {invited_user} 發送邀請".encode("utf-8"))
+                    invited_socket = players[invited_user]["socket2"]
+                    invited_socket.send(f"{username} 邀請你加入私人房間 (Port: {port_number})".encode("utf-8"))
+
+                    # 記錄邀請者和房間信息
+                    players[username]["invited_users"].append(invited_user)  # 將被邀請者追加到列表
+
+                    # 確保被邀請者的邀請來源列表存在，並追加邀請來源
+                    if "invited_by" not in players[invited_user]:
+                        players[invited_user]["invited_by"] = []  # 初始化被邀請者的邀請來源列表
+                    players[invited_user]["invited_by"].append(username)  # 追加邀請來源
+                    if "invited_ports" not in players[invited_user]:
+                        players[invited_user]["invited_ports"] = []  # 初始化被邀請者的邀請 port 列表
+                    players[invited_user]["invited_ports"].append(port_number)  # 追加邀請 port
+                else:
+                    client_socket.send(f"無法邀請 {invited_user}，該使用者不在線上或無法邀請".encode("utf-8"))
+
+            # 處理邀請回應
+            elif request.startswith("ACCEPT_INVITE"):
+                _, port_number = request.split()
+                port_number = int(port_number)  # 提取 port_number
+
+                # 確認玩家是否存在於邀請記錄中
+                room_info = next((room for room in rooms.values() if room["port_number"] == port_number), None)
+                if room_info:
+                    # 確認玩家狀態是否允許加入
+                    if len(room_info["members"]) < 2:
+                        # 更新房間和玩家狀態
+                        room_info["members"].append(username)
+                        players[username]["state"] = "in_room"
+                        # 通知被邀請玩家
+                        game_type = room_info["game_type"]
+                        client_socket.send(f"連接至私人房間伺服器的 port: {port_number}, 遊戲類型: {game_type}".encode("utf-8"))
+                    else:
+                        client_socket.send("無法加入房間，該房間人數已達上限".encode("utf-8"))
+                else:
+                    client_socket.send("無效的房間 Port，請確認邀請是否正確".encode("utf-8"))
+
+
+            # 加入房間
+            elif request.startswith("JOIN_ROOM"):
+                room_name = request.split()[1]
+                if room_name in rooms:
+                    room_info = rooms[room_name]
+                    if room_info["status"] == "waiting" and room_info["type"] == "public" and len(room_info["members"]) < 2:
+                        room_info["members"].append(username)
+                        game_type = room_info["game_type"]
+                        client_socket.send(f"連接至公開房間伺服器的 port: {room_info['port_number']}, 遊戲類型: {game_type}".encode("utf-8"))
+                        players[username]["state"]= "in_room"
+                    else:
+                        client_socket.send("無法加入房間，請檢查房間狀態及是否公開".encode("utf-8"))
+                else:
+                    client_socket.send("無法加入房間，房間不存在".encode("utf-8"))
+
+            elif request.startswith("GET_ROOM"):
+                    # 解析客戶端發送的指令，提取 port_number
+                    _, port_number = request.split()
+                    port_number = int(port_number)
+
+                    # 搜尋對應的房間名稱
+                    room_name = None
+                    for name, room_info in rooms.items():
+                        if room_info["port_number"] == port_number:
+                            room_name = name
+                            break
+                    # 回傳結果
+                    if room_name:
+                        client_socket.send(f"{room_name}".encode("utf-8"))
+            
+            elif request == "GAME_START":
+                # 根據房主找到所在的房間
+                room_name = None
+                for name, room_info in rooms.items():
+                    if username == room_info["host"]: 
+                        room_name = name
+                        break
+                if room_name:
+                    room_info = rooms[room_name]
+                    if len(room_info["members"]) == 2:  
+                        room_info["status"] = "in_game"  
+                        for member in room_info["members"]:
+                            players[member]["state"] = "in_game"  
+
+            elif request.startswith("CHAT_ROOM"):
+                message = request.split(maxsplit=1)[1]
+                broadcast(f"[聊天] {username}: {message}")
+
+            # client離開房間
+            elif request == "LEAVE_ROOM":
+                for room_name, room_info in rooms.items():
+                    if username in room_info["members"]:
+                        room_info["members"].remove(username) 
+                        players[username]["state"] = "idle"  
+                        break
+
+            # 遊戲結束
+            elif request == "END_GAME":
+                for room_name, room_info in rooms.items():
+                    if username in room_info["members"]:
+                        # 遍歷房間內所有玩家
+                        for member in room_info["members"]:
+                            # 清空 invited_users、invited_by、invited_ports 列表
+                            if "invited_users" in players[member]:
+                                players[member]["invited_users"].clear()
+                            if "invited_by" in players[member]:
+                                players[member]["invited_by"].clear()
+                            if "invited_ports" in players[member]:
+                                players[member]["invited_ports"].clear()
+
+                        # 刪除房間
+                        rooms.pop(room_name)
+                        break
+                players[username]["state"] = "idle"
+            
+            elif request.startswith("UPLOAD_GAME"):
+                try:
+                    _, game_name, description, publisher = request.split("|", maxsplit=3)
+                    file_path = f"server/game/{game_name}"
+                    # 如果遊戲名稱已存在，刪除舊檔案並覆寫
+                    if game_name in games:
+                        old_file_path = games[game_name]["path"]
+                        if os.path.exists(old_file_path):
+                            os.remove(old_file_path) 
+                    # 接收新的遊戲檔案
+                    with open(file_path, "wb") as file:
+                        while True:
+                            data = client_socket.recv(1024)
+                            if b"END_UPLOAD" in data: 
+                                split_data = data.split(b"END_UPLOAD")  
+                                file.write(split_data[0])
+                                break
+                            file.write(data)
+                    # 更新遊戲列表
+                    games[game_name] = {"publisher": publisher, "description": description, "path": file_path}
+                    save_games_to_csv(games)  
+                    client_socket.send(f"遊戲 {game_name} 已成功上傳並覆蓋舊版本！".encode("utf-8"))
+                except Exception as e:
+                    client_socket.send(f"上傳失敗: {e}".encode("utf-8"))
+            
+            elif request.startswith("DOWNLOAD_GAME"):
+                try:
+                    _, game_name = request.split(maxsplit=1)
+                    file_path = f"server/game/{game_name}"
+                    
+                    if os.path.exists(file_path):
+                        # 傳送遊戲檔案內容
+                        with open(file_path, "rb") as file:
+                            while True:
+                                chunk = file.read(1024)
+                                if not chunk:  
+                                    break
+                                client_socket.send(chunk)  
+                            client_socket.send(b"END_DOWNLOAD")
+                except Exception as e:
+                    client_socket.send(f"下載失敗: {e}".encode("utf-8"))
+
+            elif request.startswith("GET_GAME"):
+                try:
+                    _, username = request.split(maxsplit=1)
+
+                    user_games = [
+                        f"遊戲名稱: {game_name}, 上傳者: {details['publisher']}, 描述: {details['description']}"
+                        for game_name, details in games.items()
+                        if details["publisher"] == username
+                    ]
+                    if not user_games:
+                        client_socket.send(f"{username} 尚未上傳任何遊戲".encode("utf-8"))
+                    else:
+                        game_list = "\n".join(user_games)
+                        client_socket.send(game_list.encode("utf-8"))
+                except Exception as e:
+                    client_socket.send(f"無法獲取遊戲列表: {e}".encode("utf-8"))
+
+            # 登出
+            elif request == "LOGOUT":
+                players[username]["state"] = "offline"
+                broadcast(f"[系統訊息] {username}登出伺服器")
+                client_socket.send("已成功登出".encode("utf-8"))
+                client_socket.close()
+                break
+
+        except Exception as e:
+            print(f"伺服器錯誤: {e}")
+            break
+
+    client_socket.close()
+
+# 發送大廳狀態給特定玩家
+def send_lobby_status(client_socket):
+    online_players = [f"{user}: {info['state']}" for user, info in players.items() if info['state'] != 'offline']
+    public_rooms = [f"房間名稱: {name}, 創建者: {info['host']}, 狀態: {info['status']}, "
+                    f"遊戲類型: {info['game_type']}, Port: {info['port_number']}" 
+                    for name, info in rooms.items() if info["type"] == "public"]
+    status_msg = "線上玩家:\n" + "\n".join(online_players) + "\n" + "\n公開房間:\n" + "\n".join(public_rooms)+ "\n"
+    client_socket.send(status_msg.encode("utf-8"))
+
+# 發送大廳狀態給所有玩家
+def broadcast(message):
+    for username, player_info in players.items():
+        if player_info["state"] != "offline":  # 僅對非離線玩家發送訊息
+            try:
+                player_info["socket2"].send(message.encode("utf-8"))
+            except Exception as e:
+                print(f"無法向 {username} 發送訊息: {e}")
+
+
+# 設定伺服器
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(("0.0.0.0", 10924))
+server.listen(5)
+print("伺服器啟動...")
+load_from_csv()
+load_games_from_csv()
+
+# 持續接受客戶端連線
+while True:
+    client_socket, client_address = server.accept()
+    client_socket2, client_address = server.accept()
+    client_handler = threading.Thread(target=handle_client, args=(client_socket, client_socket2, client_address))
+    client_handler.start()

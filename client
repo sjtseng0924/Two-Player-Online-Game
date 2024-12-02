@@ -1,0 +1,604 @@
+#!/bin/env python3
+import socket
+import random
+import threading
+import time
+import signal
+import sys
+import os
+import importlib.util
+#140.113.235.152
+# 連接至大廳伺服器
+lobby_server_ip = "127.0.0.1"  # Lobby IP
+lobby_server_port = 10924      # Lobby port
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_socket.connect((lobby_server_ip, lobby_server_port))
+client_socket2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_socket2.connect((lobby_server_ip, lobby_server_port))
+logout = 0
+create_number = 0
+server_play = 0
+game_type = 0
+chat = 0
+player_join = 0
+game_start = 0
+be_host = 0
+invites = {}
+user_name = ""
+
+def logout_exit(signum, frame):
+    global client_socket
+    if client_socket:
+        try:
+            print("在離開前先登出...")
+            send_request("LOGOUT")
+            time.sleep(0.2)
+            client_socket.close()
+        except socket.error as e:
+            print("登出中錯誤:", e)
+        except Exception as e:
+            print("登出中錯誤:", e)
+    sys.exit(0)
+
+# 信號處理器
+signal.signal(signal.SIGINT, logout_exit)  # 捕捉 Ctrl+C
+signal.signal(signal.SIGTERM, logout_exit)  # 捕捉進程終止訊號
+#創建資料夾
+def ensure_directories(username):
+    # 確保每個使用者的 game 資料夾存在
+    game_folder = f"./{username}/game/"
+    download_folder = f"./{username}/download/"
+
+    # 動態建立資料夾
+    os.makedirs(game_folder, exist_ok=True)
+    os.makedirs(download_folder, exist_ok=True)
+# 處理伺服器回應
+def handle_server_response():
+    global create_number, game_type, logout, chat, invites
+    while True:
+        try:
+            if logout == 1:
+                break
+            response = client_socket2.recv(1024).decode("utf-8")
+            if chat == 1:
+                print(response)
+            #遊戲大廳區
+            if "加入私人房間" in response:
+                parts = response.split()
+                inviter = parts[0]  # 第一部分為邀請者名稱
+                port_number = int(parts[-1].strip(")"))  # 提取括號內的 port_number
+                invites[inviter] = port_number
+        except Exception as e:
+            print(f"伺服器連線錯誤: {e}")
+            break
+
+# 發送請求
+def send_request(request):
+    client_socket.send(request.encode("utf-8"))
+
+#房主選單
+def public_host():
+    global server_play, player_join, game_start
+    while server_play == 1:
+        action = input("離開房間 (1) / 開始遊戲 (2) (Role: Host):")
+        if action == "1":
+            server_play = 0
+            send_request("END_GAME")
+            print("房間準備關閉，返回大廳中請稍後...")
+            break
+        elif action == "2" and player_join == 1:
+            game_start = 1
+            print("開始遊戲")
+            send_request("GAME_START")
+            break
+        elif action == "2" and player_join == 0:
+            print("玩家尚未加入遊戲無法開始")
+            continue
+        elif action == "":
+            continue
+        else:
+            print("無效的選項，請重新選擇")
+
+# 當使用者創建public房間時作為伺服器
+# 創建者在這玩遊戲
+def public_room_server(port_number):
+    global server_play, player_join, game_start
+    player_join = 0
+    game_start = 0
+    server_play = 1
+    room_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    room_server_socket.bind(("0.0.0.0", int(port_number)))
+    room_server_socket.listen(1)
+    print(f"房間伺服器已啟動，等待玩家加入... (Port: {port_number})，若操作選單沒有跳出請按一下 Enter 鍵")
+
+    # 啟動房主控制執行緒
+    host_thread = threading.Thread(target=public_host)
+    host_thread.start()
+    while player_join == 0:
+        while True:
+            room_server_socket.settimeout(1)  # 設定 1 秒超時，避免阻塞
+            try:
+                room_client_socket, addr = room_server_socket.accept()
+                player_join = 1
+                print("玩家已加入房間！")
+                break
+            except socket.timeout:
+                if server_play == 0:  # 房主選擇退出房間
+                    room_server_socket.close()
+                    return
+        while True:
+            if server_play == 0:
+                message = "房主已離開房間！你即將變成房主，請稍後..."
+                room_client_socket.send(message.encode())
+                time.sleep(0.25)
+                break
+            # 檢查玩家連線狀態
+            try:
+                room_client_socket.settimeout(0.25)
+                data = room_client_socket.recv(1024)
+                if not data:
+                    print("玩家連線中斷，重新等待新玩家加入...")
+                    player_join = 0
+                    break
+            except socket.timeout:
+                pass  # 超時但連線仍然有效
+            if game_start == 0:
+                continue
+            if server_play == 1 and game_start == 1 and player_join == 1:
+                room_client_socket.settimeout(None)
+                room_server_socket.settimeout(None)
+                message = "房主已開始遊戲！ 按Enter鍵開始遊戲..."
+                room_client_socket.send(message.encode())
+                if game_type == 1:
+                    start_game("attack_game", room_client_socket)
+                else:
+                    start_game("number_guessing", room_client_socket)
+                break
+    room_client_socket.close()
+    room_server_socket.close()
+    server_play = 0
+    send_request("END_GAME")
+
+def private_host(port_number):
+    global server_play, player_join, game_start
+    while server_play == 1:
+        action = input("離開房間 (1) / 開始遊戲 (2) / 邀請玩家 (3) / 列出大廳狀態 (4) (Role: Host):")
+        if action == "1":
+            server_play = 0
+            send_request("END_GAME")
+            print("房間準備關閉，返回大廳中請稍後...")
+            break
+        elif action == "2" and player_join == 1:
+            game_start = 1
+            print("開始遊戲")
+            send_request("GAME_START")
+            break
+        elif action == "2" and player_join == 0:
+            print("玩家尚未加入遊戲無法開始")
+            continue
+        elif action == "3":
+            while True:
+                invited_user = input("輸入想邀請的玩家名稱，若您輸入文字 exit 可以離開邀請頁面:")
+                if invited_user == "":
+                    continue
+                if invited_user == "exit":
+                    break
+                send_request(f"INVITE_USER {invited_user} {port_number}")
+                response = client_socket.recv(1024).decode("utf-8")
+                print(f"{response}")
+                if "無法邀請" in response:
+                    continue
+        elif action == "4":
+            send_request("DISPLAY_STATUS")
+            response = client_socket.recv(1024).decode("utf-8")
+            print(response)
+        elif action == "":
+            continue
+        else:
+            print("無效的選項，請重新選擇。")
+
+# 當使用者創建private房間時作為伺服器
+# 創建者在這玩遊戲
+def private_room_server(port_number):
+    global server_play, player_join, game_start
+    player_join = 0
+    game_start = 0
+    server_play = 1
+    room_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    room_server_socket.bind(("0.0.0.0", int(port_number)))
+    room_server_socket.listen(1)
+    print(f"房間伺服器已啟動(Port: {port_number})，若操作選單沒有跳出請按一下 Enter 鍵")
+
+    # 啟動房主控制執行緒
+    host_thread = threading.Thread(target=private_host, args=(port_number, ))
+    host_thread.start()
+    while player_join == 0:
+        while True:
+            room_server_socket.settimeout(1)  # 設定 1 秒超時，避免阻塞
+            try:
+                room_client_socket, addr = room_server_socket.accept()
+                player_join = 1
+                print("玩家已加入房間！")
+                break
+            except socket.timeout:
+                if server_play == 0:  # 房主選擇退出房間
+                    room_server_socket.close()
+                    return
+        while True:
+            if server_play == 0:
+                message = "房主已離開房間！你即將變為房主，請稍後..."
+                room_client_socket.send(message.encode())
+                time.sleep(0.25)
+                break
+            # 檢查玩家連線狀態
+            try:
+                room_client_socket.settimeout(0.25)
+                data = room_client_socket.recv(1024)
+                if not data:
+                    # 玩家連線中斷
+                    print("玩家連線中斷，重新等待新玩家加入...")
+                    player_join = 0
+                    break
+            except socket.timeout:
+                pass  # 超時但連線仍然有效
+            if game_start == 0:
+                continue
+            if server_play == 1 and game_start == 1 and player_join == 1:
+                room_client_socket.settimeout(None)
+                room_server_socket.settimeout(None)
+                message = "房主已開始遊戲！ 按Enter鍵開始遊戲..."
+                room_client_socket.send(message.encode())
+                if game_type == 1:
+                    start_game("attack_game", room_client_socket)
+                else:
+                    start_game("number_guessing", room_client_socket)
+                break
+    room_client_socket.close()
+    room_server_socket.close()
+    server_play = 0
+    send_request("END_GAME")
+
+#遊玩者選單
+def client_control():
+    global server_play, game_start, be_host
+    while server_play == 1 and be_host == 0 and game_start == 0:
+        if game_start == 1 or be_host == 1:
+            return
+        action = input("離開房間 (1) (Role: Player):")
+        if action == "1":
+            server_play = 0
+            send_request("LEAVE_ROOM")
+            print("已離開房間，返回大廳中請稍後...")
+            break
+        elif action == "":
+            continue
+        else:
+            print("無效的選項，請重新選擇。")
+
+# 當使用者加入房間時，連接至創建者的房間伺服器
+# 被邀請端在這玩遊戲
+def connect_to_room_server(port_number, rtype):
+    global server_play, player_join, game_start, be_host
+    game_start = 0
+    be_host = 0
+    try:
+        server_play = 1
+        room_client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        room_client_socket.connect(("127.0.0.1", port_number)) 
+        print(f"成功連接至房間伺服器 (Port: {port_number})")
+        send_request(f"GET_ROOM {port_number}")
+        room_name = client_socket.recv(1024).decode("utf-8")
+        if game_type == 1:
+                download_game("attack_game.py")
+        else:
+            download_game("number_guessing.py")
+        client_thread = threading.Thread(target=client_control)
+        client_thread.start()
+        while True:
+            room_client_socket.settimeout(1) 
+            try:
+                response = room_client_socket.recv(1024).decode("utf-8")
+                break
+            except socket.timeout:
+                if server_play == 0:
+                    room_client_socket.close()
+                    return
+        if "離開房間" in response:
+            server_play = 0
+            be_host = 1
+            time.sleep(0.25)
+            print(response)
+            room_client_socket.close()
+            send_request("END_GAME")
+            if rtype == 1:
+                send_request(f"CREATE_ROOM {room_name} {game_type} public {port_number+10}")
+                response = client_socket.recv(1024).decode("utf-8")
+                time.sleep(0.25)
+                public_room_server(port_number+10)
+            else:
+                send_request(f"CREATE_ROOM {room_name} {game_type} private {port_number+10}")
+                response = client_socket.recv(1024).decode("utf-8")
+                time.sleep(0.25)
+                private_room_server(port_number+10) 
+            return
+        else:
+            print(response)
+            room_client_socket.settimeout(None)
+            game_start = 1
+            if game_type == 1:
+                start_game("attack_game", room_client_socket)
+            else:
+                start_game("number_guessing", room_client_socket)
+        room_client_socket.close()
+        server_play = 0
+        send_request("END_GAME")
+    except Exception as e:
+        print(f"無法連接至房間伺服器: {e}")
+
+def game_manage():
+    global username
+    while True:
+        action = input("回大廳 (1) / 列出你的遊戲 (2) / 上傳遊戲 (3):")
+        if action == "1":
+            return
+        elif action == "2":
+            send_request(f"GET_GAME {username}")
+            response = client_socket.recv(4096).decode("utf-8")
+            print("你上傳的遊戲如下：")
+            print(response)
+        elif action == "3":
+            game_name = input("請輸入要上傳的遊戲檔案名稱（含副檔名）: ")
+            description = input("請輸入遊戲描述: ")
+            if game_name == "":
+                print("未輸入遊戲名稱")
+                continue
+            if description == "":
+                print("未輸入遊戲描述")
+                continue
+            file_path = f"{username}/game/{game_name}"
+            try:
+                with open(file_path, "rb") as file:
+                    send_request(f"UPLOAD_GAME|{game_name}|{description}|{username}")
+                    while True:
+                        chunk = file.read(1024)
+                        if not chunk:  
+                            break
+                        client_socket.send(chunk)  
+                    client_socket.send(b"END_UPLOAD") 
+                response = client_socket.recv(1024).decode("utf-8")
+                print(response)
+            except FileNotFoundError:
+                print(f"檔案 {game_name} 不存在！")
+            except Exception as e:
+                print(f"上傳檔案失敗: {e}")
+        elif action == "":
+            continue
+        else:
+            print("無效選項，請重新選擇")
+
+def download_game(game_name):
+    local_file_path = f"{username}/download/{game_name}"
+    if not os.path.exists(local_file_path):
+        print(f"檔案 {game_name} 不存在，從伺服器下載...")
+        send_request(f"DOWNLOAD_GAME {game_name}")
+        with open(local_file_path, "wb") as file:
+            while True:
+                data = client_socket.recv(1024)
+                if b"END_DOWNLOAD" in data:
+                    split_data = data.split(b"END_DOWNLOAD")  
+                    file.write(split_data[0])
+                    break
+                file.write(data)
+        print(f"已成功下載遊戲檔案：{game_name}")
+    else:
+        print(f"檔案 {game_name} 已存在，跳過下載")
+
+def execute_game_function(game_file, function_name, sock):
+    try:
+        # 動態加載遊戲模組
+        spec = importlib.util.spec_from_file_location("game_module", game_file)
+        game_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(game_module)
+
+        # 執行指定的函式
+        if hasattr(game_module, function_name):
+            game_function = getattr(game_module, function_name)
+            game_function(sock)  # 傳入必要參數
+        else:
+            print(f"遊戲檔案中找不到函式 {function_name}！")
+    except Exception as e:
+        print(f"執行遊戲時發生錯誤: {e}")
+
+def start_game(game_name, sock):
+    game_file = f"{username}/download/{game_name}.py"
+    if "attack" in game_name:
+        execute_game_function(game_file, "attack_game", sock)
+    else:
+        execute_game_function(game_file, "number_guessing", sock)
+
+# 顯示大廳選項
+def display_lobby_options():
+    global logout, server_play, chat
+    threading.Thread(target=handle_server_response).start()
+    time.sleep(0.25)
+    while True:
+        chat = 0
+        if server_play == 1:
+            continue
+        action = input("登出 (1) / 創建房間 (2) / 加入房間 (3) / 列出大廳狀態 (4) / 群體聊天室 (5) / 回覆邀請 (6) / 遊戲管理 (7): ")
+        if action == "1":
+            send_request("LOGOUT")
+            logout = 1 
+            return
+        elif action == "2":
+            global create_number, game_type, room_name
+            room_name = input("請輸入房間名稱: ")
+            game_type = input("請選擇遊戲類型（ Attack Game (1) / Number Guessing (2) ）: ")
+            room_type = input("請選擇房間類型（ public / private ）: ")
+            create_number = input("請輸入房間的 port 號碼( 10005-65534 ): ")
+            if room_name == "" or game_type == "" or room_type == "" or create_number == "":
+                continue
+            send_request(f"CHECK_GAME {game_type}")
+            response = client_socket.recv(1024).decode("utf-8")
+            if "不存在" in response:
+                print("該遊戲還未被上傳到伺服器，請去遊戲管理區上傳")
+                continue
+            game_type = int(game_type)
+            create_number = int(create_number)
+            if room_name == "exit":
+                print("此為系統用字無法作為房間名稱")
+                continue
+            if room_type != "public" and room_type != "private":
+                print("房間類型請輸入 public 或 private")
+                continue
+            if game_type != 1 and game_type != 2:
+                print("遊戲類型請輸入 1 或 2")
+                continue
+            if create_number <= 10005:
+                print("port請輸入在10005以上")
+                continue
+            if create_number >= 65534:
+                print("port請輸入在65534以下")
+                continue
+            if game_type == 1:
+                download_game("attack_game.py")
+            else:
+                download_game("number_guessing.py")
+            send_request(f"CREATE_ROOM {room_name} {game_type} {room_type} {create_number}")
+            response = client_socket.recv(1024).decode("utf-8")
+            if "已存在" in response or "無法加入房間" in response:
+                print(response)
+                continue
+            elif "公開房間已建立" in response:
+                public_room_server(create_number)
+            elif "私人房間已建立" in response:
+                private_room_server(create_number)
+        elif action == "3":
+            room_name = input("請輸入房間名稱，輸入文字 exit 可以回大廳: ")
+            if room_name == "" or room_name == "exit":
+                continue
+            send_request(f"JOIN_ROOM {room_name}")
+            response = client_socket.recv(1024).decode("utf-8")
+            if "無法加入房間" in response:
+                print(response)
+                response = ""
+                continue
+            elif "公開房間伺服器的 port" in response:
+                parts = response.split(", ")
+                port_part = parts[0].split(": ")[1]
+                create_number = int(port_part)
+                game_type_part = parts[1].split(": ")[1]
+                game_type = int(game_type_part)
+                connect_to_room_server(create_number, 1)
+        elif action == "4":
+            send_request("DISPLAY_STATUS")
+            response = client_socket.recv(1024).decode("utf-8")
+            print(response)
+        elif action == "5":
+            print("歡迎隨時留言跟其他玩家互動，輸入文字 exit 可以回大廳")
+            chat = 1
+            while True:
+                message = input()
+                if message == "exit":
+                    break
+                else:
+                    send_request(f"CHAT_ROOM {message}")
+        elif action == "6":
+            global invites
+            if not invites:
+                print("目前沒有收到任何邀請")
+                continue
+            print("收到的邀請列表：")
+            for i, (username, port) in enumerate(invites.items(), 1):
+                print(f"{i}. {username} 邀請你加入房間 (Port: {port})")
+            selection = input("請輸入要接受的邀請編號，輸入文字 exit 回大廳: ")
+            if selection == "exit":
+                continue
+            if selection.isdigit():
+                selection = int(selection)
+                if 1 <= selection <= len(invites):
+                    selected_username = list(invites.keys())[selection - 1]
+                    selected_port = invites[selected_username]
+                    send_request(f"ACCEPT_INVITE {selected_port}")
+                    response = client_socket.recv(1024).decode("utf-8")
+                    invites.pop(selected_username)  
+                    if "私人房間伺服器的 port" in response:
+                        parts = response.split(", ")
+                        port_part = parts[0].split(": ")[1]
+                        create_number = int(port_part)
+                        game_type_part = parts[1].split(": ")[1]
+                        game_type = int(game_type_part)
+                        connect_to_room_server(create_number, 2)
+                    else:
+                        print(response)
+                        continue
+        elif action == "7":
+            game_manage()
+        elif action == "":
+            continue
+        else:
+            print("無效選項，請重新選擇")
+
+# 註冊或登入
+def authenticate_user():
+    global logout, username
+    logout = 0
+    time.sleep(0.25)
+    while True:
+        action = input("註冊 (1) / 登入 (2): ")
+        if action == "1":
+            username = input("請輸入用戶名: ")
+            password = input("請輸入密碼: ")
+            if username=="" or password =="":
+                print("無效的輸入")
+                continue
+            if username=="exit":
+                print("系統用字無法註冊為帳號名稱")
+                continue
+            send_request(f"REGISTER {username} {password}")
+            response = client_socket.recv(1024).decode("utf-8")
+            print(response)
+            if "註冊成功" in response:
+                ensure_directories(username)
+                continue
+            elif "註冊失敗" in response:
+                continue
+        elif action == "2":
+            username = input("請輸入用戶名: ")
+            if username == "":
+                print("無效的輸入")
+                continue
+            send_request(f"LOGIN {username}")
+            response = client_socket.recv(1024).decode("utf-8")
+            if "登入失敗" in response:
+                print(response)
+                continue
+            elif "輸入密碼" in response:
+                password = input("請輸入密碼: ")
+                if password == "":
+                    print("無效的輸入")
+                    continue
+                send_request(f"PASSWORD {password}")
+                response = client_socket.recv(1024).decode("utf-8")
+                print(response)
+                if "登入成功" in response:
+                    break
+                elif "登入失敗" in response:
+                    continue
+        else:
+            print("無效選項，請重新選擇")
+    display_lobby_options()
+
+# 開始註冊或登入
+authenticate_user()
+while True:
+    if logout != 1:
+        continue
+    client_socket.close()
+    client_socket2.close()
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_socket.connect((lobby_server_ip, lobby_server_port))
+    client_socket2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_socket2.connect((lobby_server_ip, lobby_server_port))
+    time.sleep(0.25)
+    authenticate_user()
